@@ -6,12 +6,16 @@
 输入带 ``"recovery": true`` 时追加恢复规划：只把当前离线副本作为候选，
 枚举恢复子集并逐一重新裁决，找出恢复数量最少且恢复后读写仲裁仍两两
 相交的集合。
+
+输入带 ``"maintenance_rehearsal"`` 时预演维护顺序：每个指定副本恰好
+切换一次在线状态，并要求初态及每一步切换后都保持读写可行且所有可行
+读写仲裁相交。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from itertools import combinations
+from dataclasses import dataclass, replace
+from itertools import combinations, permutations
 from typing import Any, Mapping
 
 
@@ -206,6 +210,44 @@ def _parse_recovery(value: Any) -> bool:
     return value
 
 
+def _parse_maintenance_rehearsal(
+    value: Any,
+    replicas: list[_Replica],
+) -> tuple[int, ...] | None:
+    """解析维护预演请求，并转换为按副本 id 排序的下标序列。
+
+    协议使用 ``{"maintenance_rehearsal": {"replica_ids": [...]}}``；直接
+    传 id 列表也接受，方便 CLI 手工调用。预演顺序按 id 序列比较字典序，
+    这里先检查互异并排序，后续生成排列时即可按固定 id 字典序枚举。
+    """
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        value = value.get("replica_ids")
+        if value is None:
+            raise ValidationError("maintenance_rehearsal.replica_ids is required")
+    if not isinstance(value, list):
+        raise ValidationError("maintenance_rehearsal must be a list")
+    if len(value) > 5:
+        raise ValidationError("maintenance_rehearsal can contain at most 5 replica ids")
+
+    ids = _as_str_list(value, "maintenance_rehearsal.replica_ids")
+    if len(ids) != len(set(ids)):
+        raise ValidationError("maintenance_rehearsal replica ids must be unique")
+
+    index_by_id = {replica.replica_id: index for index, replica in enumerate(replicas)}
+    indices: list[int] = []
+    for replica_id in ids:
+        if replica_id not in index_by_id:
+            raise ValidationError(
+                f"maintenance_rehearsal references unknown replica id: {replica_id}"
+            )
+        indices.append(index_by_id[replica_id])
+
+    # 返回排序后的下标集合；_plan_maintenance_rehearsal 枚举其全部排列。
+    return tuple(sorted(indices))
+
+
 def _evaluate(
     replicas: list[_Replica],
     read: _Side,
@@ -390,6 +432,80 @@ def _plan_recovery(
     }
 
 
+def _maintenance_view(evaluated: Mapping[str, Any]) -> dict[str, Any]:
+    """从一次切换后的裁决结果中截取预演需要复核的字段。"""
+    return {
+        "read_possible": evaluated["read_possible"],
+        "write_possible": evaluated["write_possible"],
+        "minimum_intersection": evaluated["minimum_intersection"],
+        "witness_read": evaluated["witness_read"],
+        "witness_write": evaluated["witness_write"],
+    }
+
+
+def _failure(reason: str) -> dict[str, Any]:
+    return {
+        "possible": False,
+        "failure_reason": reason,
+        "order": None,
+        "steps": None,
+    }
+
+
+def _plan_maintenance_rehearsal(
+    replicas: list[_Replica],
+    read: _Side,
+    write: _Side,
+    datacenter_masks: Mapping[str, int],
+    selected: tuple[int, ...],
+    initial: Mapping[str, Any],
+) -> dict[str, Any]:
+    """枚举所选副本的全部切换排列，返回字典序最小的全程安全顺序。
+
+    每一步都可能让离线副本上线；上线后会产生新的可选仲裁集，安全性对在
+    线副本集合不单调。因此这里不能只检查初态和终态，必须对每个排列的每
+    个前缀重新完整枚举读、写仲裁。任一中间状态失去可行性或出现不相交对，
+    该排列立即废弃，且不返回其中尚可执行的前缀。
+    """
+    if not initial["safe"]:
+        return _failure("initial_state_unsafe")
+
+    # permutations 按元组字典序生成；selected 已按 id 排序，所以第一个
+    # 全程安全排列就是副本 id 序列字典序最小者。
+    for order in permutations(selected):
+        state = replicas
+        steps: list[dict[str, Any]] = []
+        for step_number, index in enumerate(order, start=1):
+            replica = state[index]
+            replica_id = replica.replica_id
+            state = [
+                replace(item, online=not item.online)
+                if item_index == index
+                else item
+                for item_index, item in enumerate(state)
+            ]
+            evaluated = _evaluate(state, read, write, datacenter_masks)
+            if not evaluated["safe"]:
+                break
+            steps.append(
+                {
+                    "step": step_number,
+                    "replica_id": replica_id,
+                    "safe": True,
+                    **_maintenance_view(evaluated),
+                }
+            )
+        else:
+            return {
+                "possible": True,
+                "failure_reason": None,
+                "order": [replicas[index].replica_id for index in order],
+                "steps": steps,
+            }
+
+    return _failure("no_safe_complete_order")
+
+
 def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
     """分析输入并返回稳定的 JSON 兼容结果。"""
     if not isinstance(payload, Mapping):
@@ -400,11 +516,23 @@ def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
     write = _side(payload.get("write", {}), "write")
     _check_required_datacenters(replicas, read, write)
     recovery = _parse_recovery(payload.get("recovery"))
+    maintenance_rehearsal = _parse_maintenance_rehearsal(
+        payload.get("maintenance_rehearsal"), replicas
+    )
 
     datacenter_masks = _required_masks(replicas)
     result = _evaluate(replicas, read, write, datacenter_masks)
     if recovery:
         result["recovery_plan"] = _plan_recovery(
             replicas, read, write, datacenter_masks, result
+        )
+    if maintenance_rehearsal is not None:
+        result["maintenance_rehearsal"] = _plan_maintenance_rehearsal(
+            replicas,
+            read,
+            write,
+            datacenter_masks,
+            maintenance_rehearsal,
+            result,
         )
     return result

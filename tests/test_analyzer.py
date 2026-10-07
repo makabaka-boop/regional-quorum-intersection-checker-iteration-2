@@ -5,7 +5,7 @@ import threading
 import urllib.error
 import urllib.request
 from copy import deepcopy
-from itertools import combinations
+from itertools import combinations, permutations
 from pathlib import Path
 
 import pytest
@@ -196,6 +196,88 @@ def expected_recovery_plan(payload):
 
 def analyze_with_recovery(payload):
     return analyze({**payload, "recovery": True})
+
+
+def toggled_payload(payload, positions):
+    """按 id 排序后的下标切换副本在线状态，并返回新 payload。"""
+    toggled = deepcopy(payload)
+    sorted_replicas = sorted(toggled["replicas"], key=lambda item: item["id"])
+    actual_position_by_sorted_position = {
+        sorted_position: next(
+            actual_position
+            for actual_position, item in enumerate(toggled["replicas"])
+            if item["id"] == sorted_replicas[sorted_position]["id"]
+        )
+        for sorted_position in range(len(sorted_replicas))
+    }
+    for position in positions:
+        actual_position = actual_position_by_sorted_position[position]
+        toggled["replicas"][actual_position]["online"] = not toggled["replicas"][
+            actual_position
+        ]["online"]
+    return toggled
+
+
+def maintenance_step_view(evaluated):
+    return {
+        "read_possible": evaluated["read_possible"],
+        "write_possible": evaluated["write_possible"],
+        "minimum_intersection": evaluated["minimum_intersection"],
+        "witness_read": evaluated["witness_read"],
+        "witness_write": evaluated["witness_write"],
+    }
+
+
+def expected_maintenance_rehearsal(payload, selected_ids=None):
+    """独立枚举全部切换排列，对拍维护顺序预演。"""
+    if selected_ids is None:
+        selected_ids = payload["maintenance_rehearsal"]["replica_ids"]
+    replicas_sorted = sorted(payload["replicas"], key=lambda item: item["id"])
+    positions_by_id = {item["id"]: index for index, item in enumerate(replicas_sorted)}
+    selected_positions = [positions_by_id[item_id] for item_id in selected_ids]
+
+    initial = expected_analysis(payload)
+    failure = lambda reason: {
+        "possible": False,
+        "failure_reason": reason,
+        "order": None,
+        "steps": None,
+    }
+    if not initial["safe"]:
+        return failure("initial_state_unsafe")
+
+    for order in permutations(sorted(selected_positions)):
+        steps = []
+        state = payload
+        safe_order = True
+        for step_number, position in enumerate(order, start=1):
+            replica = sorted(state["replicas"], key=lambda item: item["id"])[position]
+            state = toggled_payload(state, [position])
+            evaluated = expected_analysis(state)
+            if not evaluated["safe"]:
+                safe_order = False
+                break
+            steps.append(
+                {
+                    "step": step_number,
+                    "replica_id": replica["id"],
+                    "safe": True,
+                    **maintenance_step_view(evaluated),
+                }
+            )
+        if safe_order:
+            return {
+                "possible": True,
+                "failure_reason": None,
+                "order": [replicas_sorted[position]["id"] for position in order],
+                "steps": steps,
+            }
+
+    return failure("no_safe_complete_order")
+
+
+def analyze_with_rehearsal(payload, selected_ids):
+    return analyze({**payload, "maintenance_rehearsal": {"replica_ids": selected_ids}})
 
 
 def test_weight_threshold_alone_misses_region_induced_disjoint_pair():
@@ -597,6 +679,216 @@ def test_random_recovery_plans_match_subset_enumeration(seed):
     }
 
 
+def test_maintenance_rehearsal_takes_offline_and_reports_witness():
+    payload = make_payload(
+        [
+            replica("a1", 4, "A"),
+            replica("a2", 4, "A"),
+            replica("b1", 4, "B"),
+            replica("b2", 4, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze_with_rehearsal(payload, ["a1"])
+    after = expected_analysis(toggled_payload(payload, [0]))
+
+    assert result["maintenance_rehearsal"] == {
+        "possible": True,
+        "failure_reason": None,
+        "order": ["a1"],
+        "steps": [
+            {
+                "step": 1,
+                "replica_id": "a1",
+                "safe": True,
+                **maintenance_step_view(after),
+            }
+        ],
+    }
+
+
+def test_maintenance_rehearsal_tie_uses_lexicographically_smallest_safe_order():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B"),
+            replica("b2", 6, "B", online=False),
+        ],
+        read_threshold=6,
+        write_threshold=6,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze_with_rehearsal(payload, ["a1", "b2"])
+
+    # 先下线 a1 仍保留 A 机房；先上线 b2 会产生 {a1} 与 {b2} 这类不相交仲裁。
+    assert result["maintenance_rehearsal"]["possible"] is True
+    assert result["maintenance_rehearsal"]["order"] == ["a1", "b2"]
+    assert result["maintenance_rehearsal"] == expected_maintenance_rehearsal(
+        payload, ["a1", "b2"]
+    )
+
+
+def test_maintenance_rehearsal_bringing_online_can_break_intersection():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B"),
+            replica("b2", 6, "B", online=False),
+        ],
+        read_threshold=6,
+        write_threshold=6,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    result = analyze_with_rehearsal(payload, ["b2"])
+    rehearsal = result["maintenance_rehearsal"]
+
+    assert result["safe"] is True
+    assert rehearsal == {
+        "possible": False,
+        "failure_reason": "no_safe_complete_order",
+        "order": None,
+        "steps": None,
+    }
+    assert rehearsal == expected_maintenance_rehearsal(payload, ["b2"])
+
+
+def test_maintenance_rehearsal_cross_datacenter_failure_has_no_partial_plan():
+    payload = make_payload(
+        [
+            replica("a1", 4, "A"),
+            replica("a2", 4, "A"),
+            replica("b1", 4, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    rehearsal = analyze_with_rehearsal(payload, ["b1"])["maintenance_rehearsal"]
+
+    # b1 是唯一在线 B 机房副本；切换后两侧仲裁均不可行，不能返回可执行前缀。
+    assert rehearsal == {
+        "possible": False,
+        "failure_reason": "no_safe_complete_order",
+        "order": None,
+        "steps": None,
+    }
+    assert rehearsal == expected_maintenance_rehearsal(payload, ["b1"])
+
+
+def test_maintenance_rehearsal_initial_unsafe_is_clear_failure():
+    payload = make_payload(
+        [
+            replica("a1", 6, "A"),
+            replica("a2", 6, "A"),
+            replica("b1", 6, "B"),
+            replica("b2", 6, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+    rehearsal = analyze_with_rehearsal(payload, ["a1"])["maintenance_rehearsal"]
+
+    assert rehearsal == {
+        "possible": False,
+        "failure_reason": "initial_state_unsafe",
+        "order": None,
+        "steps": None,
+    }
+
+
+@pytest.mark.parametrize("seed", range(35))
+def test_maintenance_rehearsal_enumerates_all_small_permutations(seed):
+    payload = random_payload(seed)
+    n = len(payload["replicas"])
+    # 小实例最多选择五个，逐排列与独立 oracle 对拍。
+    k = min(n, 1 + seed % 5)
+    selected = sorted(item["id"] for item in payload["replicas"][:k])
+
+    result = analyze(
+        {**payload, "maintenance_rehearsal": {"replica_ids": selected}}
+    )
+
+    assert result == {
+        **expected_analysis(payload),
+        "maintenance_rehearsal": expected_maintenance_rehearsal(payload, selected),
+    }
+
+
+def test_maintenance_rehearsal_accepts_direct_id_list_and_input_order_does_not_matter():
+    payload = make_payload(
+        [
+            replica("b1", 6, "B"),
+            replica("a1", 6, "A"),
+        ],
+        read_threshold=6,
+        write_threshold=6,
+    )
+
+    object_form = analyze(
+        {**payload, "maintenance_rehearsal": {"replica_ids": ["b1", "a1"]}}
+    )
+    list_form = analyze({**payload, "maintenance_rehearsal": ["a1", "b1"]})
+
+    assert object_form["maintenance_rehearsal"] == expected_maintenance_rehearsal(
+        payload, ["b1", "a1"]
+    )
+    assert (
+        list_form["maintenance_rehearsal"]
+        == object_form["maintenance_rehearsal"]
+    )
+
+
+@pytest.mark.parametrize(
+    "selection,message",
+    [
+        ("a1", "must be a list"),
+        (["a1"] * 6, "at most 5"),
+        (["a1", "a1"], "must be unique"),
+        (["missing"], "unknown replica"),
+        ([1], "must be a list of strings"),
+    ],
+)
+def test_maintenance_rehearsal_validates_selection(selection, message):
+    payload = make_payload([replica("a1"), replica("a2")])
+    payload["maintenance_rehearsal"] = {"replica_ids": selection}
+    with pytest.raises(ValidationError, match=message):
+        analyze(payload)
+
+
+def test_maintenance_rehearsal_empty_selection_checks_initial_state():
+    payload = make_payload(
+        [replica("a", 9), replica("b", 9)],
+        read_threshold=18,
+        write_threshold=18,
+    )
+
+    rehearsal = analyze(
+        {**payload, "maintenance_rehearsal": {"replica_ids": []}}
+    )["maintenance_rehearsal"]
+
+    assert rehearsal == {
+        "possible": True,
+        "failure_reason": None,
+        "order": [],
+        "steps": [],
+    }
+
+
 def test_recovery_disabled_keeps_response_unchanged():
     payload = make_payload(
         [replica("a", 9), replica("b", 9)],
@@ -716,6 +1008,107 @@ def recovery_payload():
         read_dcs=["A", "B"],
         write_dcs=["A", "B"],
     )
+
+
+def maintenance_payload():
+    return make_payload(
+        [
+            replica("a1", 4, "A"),
+            replica("a2", 4, "A"),
+            replica("b1", 4, "B"),
+            replica("b2", 4, "B"),
+        ],
+        read_threshold=12,
+        write_threshold=12,
+        read_dcs=["A", "B"],
+        write_dcs=["A", "B"],
+    )
+
+
+def test_cli_maintenance_rehearsal_enabled_via_payload():
+    payload = {
+        **maintenance_payload(),
+        "maintenance_rehearsal": {"replica_ids": ["a1"]},
+    }
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout) == {
+        **expected_analysis(payload),
+        "maintenance_rehearsal": expected_maintenance_rehearsal(payload, ["a1"]),
+    }
+
+
+def test_cli_invalid_maintenance_selection_exits_with_error():
+    payload = {
+        **maintenance_payload(),
+        "maintenance_rehearsal": {"replica_ids": ["missing"]},
+    }
+    completed = subprocess.run(
+        [sys.executable, "-m", "quorum"],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        cwd=ROOT,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "unknown replica id: missing" in completed.stderr
+    assert completed.stdout == ""
+
+
+def test_http_maintenance_rehearsal_uses_shared_analyzer():
+    server = build_server("127.0.0.1", 0)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        payload = {
+            **maintenance_payload(),
+            "maintenance_rehearsal": {"replica_ids": ["a1"]},
+        }
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+            assert json.loads(response.read()) == {
+                **expected_analysis(payload),
+                "maintenance_rehearsal": expected_maintenance_rehearsal(
+                    payload, ["a1"]
+                ),
+            }
+
+        bad_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/analyze",
+            data=json.dumps(
+                {
+                    **maintenance_payload(),
+                    "maintenance_rehearsal": {"replica_ids": ["a1"] * 6},
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(bad_request, timeout=5)
+        assert exc_info.value.code == 400
+        assert b"at most 5" in exc_info.value.read()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_cli_recovery_planning_enabled_via_payload():
