@@ -35,7 +35,8 @@
 - `online`：布尔值；
 - `read.weight_threshold`、`write.weight_threshold`：非负整数，缺省为 0；
 - `required_datacenters`：非空 ASCII 机房名数组，同层不得重复，缺省为空，且每个机房都必须在 `replicas` 中出现；
-- `recovery`：可选布尔值，为 `true` 时在结果中追加恢复规划，缺省为 `false`。
+- `recovery`：可选布尔值，为 `true` 时在结果中追加恢复规划，缺省为 `false`；
+- `maintenance_rehearsal`：可选的副本 ID 数组，最多 5 个且必须互异；出现时追加维护顺序预演，空数组表示只检查起始状态。
 
 阈值为 0 且没有机房要求时，空仲裁集可行。
 
@@ -92,6 +93,54 @@
 
 未启用规划时（缺省或 `"recovery": false`），响应不包含 `recovery_plan`，与原输出完全一致。示例见 `examples/recovery.json`。
 
+## 维护顺序预演
+
+请求带 `maintenance_rehearsal` 副本 ID 数组时，响应追加 `maintenance_rehearsal_plan` 字段。数组中的每个副本都会且只会切换一次在线状态：在线副本下线、离线副本恢复。
+
+预演从原始 `online` 状态开始，要求：
+
+1. 起始状态已经同时存在可行读、写仲裁，且任意可行读写对至少共享一台副本；
+2. 每一次切换后的状态也都必须满足同样条件；
+3. 在所有完整安全的切换顺序中，返回副本 ID 序列字典序最小者。
+
+恢复一台副本不是单调改善：新增在线副本可能让原本不存在的仲裁变为可行，也可能产生新的不相交读写对。因此算法枚举最多 `5! = 120` 个排列，并对每个排列的每个前缀都复用解析层和仲裁枚举重新完整裁决，不能只检查最终状态。
+
+成功时：
+
+```json
+{
+  "feasible": true,
+  "order": ["a", "x"],
+  "steps": [
+    {
+      "replica_id": "a",
+      "online_after": false,
+      "read_possible": true,
+      "write_possible": true,
+      "minimum_intersection": 1,
+      "witness_read": {"replica_ids": ["b", "c"]},
+      "witness_write": {"replica_ids": ["b", "x"]},
+      "safe": true
+    }
+  ]
+}
+```
+
+每一步的两个见证是切换后真实可行的读、写仲裁，并达到该状态下所有可行读写对的最小交集；空请求在起始状态安全时返回空 `order` 和空 `steps`。
+
+起始状态不安全，或不存在每一步都安全的完整顺序时，只返回明确失败，不返回可执行的部分计划：
+
+```json
+{
+  "feasible": false,
+  "order": null,
+  "steps": null,
+  "reason": "no complete safe toggle order exists"
+}
+```
+
+未提供 `maintenance_rehearsal` 字段时，响应不包含 `maintenance_rehearsal_plan` 字段，原分析及恢复规划输出保持不变。该字段可以与 `recovery: true` 同时出现，两者分别报告。示例见 `examples/maintenance_rehearsal.json`。
+
 ## 本地命令行
 
 从标准输入读取：
@@ -138,6 +187,8 @@ curl -fsS http://127.0.0.1:8080/health
 
 恢复规划复用同一枚举：把候选子集中的离线副本标记为在线后重新执行完整裁决，按子集大小递增找到第一个存在安全集合的规模，并在该规模内取 id 列表字典序最小的安全集合。
 
+维护顺序预演同样复用该裁决：按 id 排序候选后枚举排列，使第一个完整可行排列就是字典序最小序列；逐个前缀切换副本在线状态并重新枚举读、写仲裁。任一步不可行或最小交集为 0 即放弃该排列，失败响应不保留已经走过的前缀。
+
 ## 开发与测试
 
 开发依赖见 `requirements-dev.txt`：
@@ -156,4 +207,5 @@ pytest
 - 相等权重并列；
 - 总成员数优先于字典序；
 - 恢复规划：跨机房恢复、空仲裁集不可达、并列最优、恢复更多反而不相交的非单调场景，以及随机实例的独立子集枚举对拍；
+- 维护顺序预演：小实例枚举全部切换排列，对拍字典序并列顺序、跨机房限制、恢复引入新区裁、中途失守和失败时无部分计划；
 - CLI 和 HTTP 服务。

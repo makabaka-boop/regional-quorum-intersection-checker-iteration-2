@@ -1,0 +1,12 @@
+{
+  "replicas": [
+    {"id": "a", "weight": 2, "datacenter": "A", "online": true},
+    {"id": "b", "weight": 2, "datacenter": "A", "online": true},
+    {"id": "c", "weight": 2, "datacenter": "A", "online": true},
+    {"id": "x", "weight": 2, "datacenter": "A", "online": false},
+    {"id": "y", "weight": 2, "datacenter": "A", "online": false}
+  ],
+  "read": {"weight_threshold": 4, "required_datacenters": []},
+  "write": {"weight_threshold": 4, "required_datacenters": []},
+  "maintenance_rehearsal": ["a", "b", "c", "x", "y"]
+}

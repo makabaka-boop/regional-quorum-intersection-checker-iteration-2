@@ -6,12 +6,16 @@
 输入带 ``"recovery": true`` 时追加恢复规划：只把当前离线副本作为候选，
 枚举恢复子集并逐一重新裁决，找出恢复数量最少且恢复后读写仲裁仍两两
 相交的集合。
+
+输入带 ``"maintenance_rehearsal"`` 副本 ID 列表时追加维护顺序预演：枚举
+这些副本的全部切换排列，起始状态和每次切换后都重新裁决，并选择字典序
+最小的完整可行排列。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import combinations
+from itertools import combinations, permutations
 from typing import Any, Mapping
 
 
@@ -204,6 +208,117 @@ def _parse_recovery(value: Any) -> bool:
     if not isinstance(value, bool):
         raise ValidationError("recovery must be a boolean")
     return value
+
+
+def _parse_maintenance_rehearsal(
+    value: Any,
+    replicas: list[_Replica],
+) -> list[int] | None:
+    """解析预演请求，返回按副本 ID 排序后的下标列表。"""
+    if value is None:
+        return None
+
+    replica_ids = _as_str_list(value, "maintenance_rehearsal")
+    if len(replica_ids) > 5:
+        raise ValidationError(
+            "maintenance_rehearsal may contain at most 5 replica ids"
+        )
+    if len(replica_ids) != len(set(replica_ids)):
+        raise ValidationError("maintenance_rehearsal replica ids must be unique")
+
+    indices = {replica.replica_id: index for index, replica in enumerate(replicas)}
+    unknown = [replica_id for replica_id in replica_ids if replica_id not in indices]
+    if unknown:
+        raise ValidationError(
+            f"maintenance_rehearsal references unknown replica id: {unknown[0]}"
+        )
+
+    return sorted(indices[replica_id] for replica_id in replica_ids)
+
+
+def _toggle_replicas(
+    replicas: list[_Replica],
+    toggled: set[int],
+) -> list[_Replica]:
+    """把指定下标的副本在线状态取反，其余属性保持不变。"""
+    return [
+        _Replica(
+            replica_id=replica.replica_id,
+            weight=replica.weight,
+            datacenter=replica.datacenter,
+            online=not replica.online if index in toggled else replica.online,
+        )
+        for index, replica in enumerate(replicas)
+    ]
+
+
+def _maintenance_view(evaluated: Mapping[str, Any]) -> dict[str, Any]:
+    """返回一次切换后可独立复核的裁决字段。"""
+    return {
+        "read_possible": evaluated["read_possible"],
+        "write_possible": evaluated["write_possible"],
+        "minimum_intersection": evaluated["minimum_intersection"],
+        "witness_read": evaluated["witness_read"],
+        "witness_write": evaluated["witness_write"],
+        "safe": evaluated["safe"],
+    }
+
+
+def _maintenance_failure(reason: str) -> dict[str, Any]:
+    return {
+        "feasible": False,
+        "order": None,
+        "steps": None,
+        "reason": reason,
+    }
+
+
+def _plan_maintenance_rehearsal(
+    replicas: list[_Replica],
+    read: _Side,
+    write: _Side,
+    datacenter_masks: Mapping[str, int],
+    candidate_indices: list[int],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """枚举全部切换排列，寻找每一步都安全的字典序最小完整顺序。
+
+    安全性相对于当前在线集合不是单调变化：离线副本恢复后可能引入新的
+    可行仲裁及不相交读写对。因此排列中的每个前缀都必须完整重新裁决；
+    最终状态安全不能替代中间状态检查。
+    """
+    if not current["safe"]:
+        return _maintenance_failure("initial state is unsafe")
+
+    for order in permutations(candidate_indices):
+        toggled: set[int] = set()
+        steps: list[dict[str, Any]] = []
+        for index in order:
+            toggled.add(index)
+            evaluated = _evaluate(
+                _toggle_replicas(replicas, toggled),
+                read,
+                write,
+                datacenter_masks,
+            )
+            if not evaluated["safe"]:
+                break
+            steps.append(
+                {
+                    "replica_id": replicas[index].replica_id,
+                    "online_after": not replicas[index].online,
+                    **_maintenance_view(evaluated),
+                }
+            )
+
+        if len(steps) == len(order):
+            return {
+                "feasible": True,
+                "order": [replicas[index].replica_id for index in order],
+                "steps": steps,
+            }
+
+    return _maintenance_failure("no complete safe toggle order exists")
 
 
 def _evaluate(
@@ -400,11 +515,24 @@ def analyze(payload: Mapping[str, Any]) -> dict[str, Any]:
     write = _side(payload.get("write", {}), "write")
     _check_required_datacenters(replicas, read, write)
     recovery = _parse_recovery(payload.get("recovery"))
+    maintenance_indices = _parse_maintenance_rehearsal(
+        payload.get("maintenance_rehearsal"),
+        replicas,
+    )
 
     datacenter_masks = _required_masks(replicas)
     result = _evaluate(replicas, read, write, datacenter_masks)
     if recovery:
         result["recovery_plan"] = _plan_recovery(
             replicas, read, write, datacenter_masks, result
+        )
+    if maintenance_indices is not None:
+        result["maintenance_rehearsal_plan"] = _plan_maintenance_rehearsal(
+            replicas,
+            read,
+            write,
+            datacenter_masks,
+            maintenance_indices,
+            result,
         )
     return result
